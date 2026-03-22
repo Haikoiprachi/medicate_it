@@ -2,7 +2,10 @@
 MedTriage AI — FastAPI + LangGraph Backend
 Multi-Agent Medical Triage System with Privacy Protection
 """
-
+from database import create_tables, get_db, Patient, Doctor
+from auth import hash_password, verify_password, create_token, get_current_user, generate_id
+from sqlalchemy.orm import Session
+from notifications import notify_nearest_doctor
 import os
 import re
 import uuid
@@ -12,7 +15,8 @@ import json
 from datetime import datetime
 from typing import TypedDict, Optional
 
-from fastapi import FastAPI, HTTPException, Request
+from fastapi import FastAPI, HTTPException, Request, Depends
+from fastapi.exceptions import RequestValidationError
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import JSONResponse
 from pydantic import BaseModel, field_validator
@@ -28,6 +32,7 @@ logging.basicConfig(level=logging.INFO, format="%(asctime)s [%(levelname)s] %(me
 logger = logging.getLogger("medtriage")
 
 app = FastAPI(title="MedTriage AI", description="Multi-Agent Medical Triage System", version="1.0.0")
+create_tables()
 
 app.add_middleware(
     CORSMiddleware,
@@ -67,28 +72,21 @@ class PrivacyEngine:
 
 privacy = PrivacyEngine()
 
-# ── Smart Pre-Scorer (rule-based, never wrong) ─────────────────────────────────
+# ── Smart Pre-Scorer ───────────────────────────────────────────────────────────
 def compute_base_score(symptoms_text: str, extracted: dict, analysis: dict) -> dict:
-    """
-    Rule-based scoring that runs BEFORE the LLM scorer.
-    Ensures critical symptoms like chest pain, high pain scores are never underrated.
-    """
     text_lower = symptoms_text.lower()
-    symptoms = extracted.get("symptoms", [])
-    red_flags = analysis.get("red_flags", [])
+    symptoms   = extracted.get("symptoms", [])
+    red_flags  = analysis.get("red_flags", [])
     body_systems = analysis.get("body_systems", [])
-    onset = extracted.get("onset", "unknown")
+    onset      = extracted.get("onset", "unknown")
 
-    # ── 1. Symptom Severity Score (0-30) ──────────────────────────────────────
-    # Check for explicit pain rating (e.g. "9/10", "8 out of 10")
     pain_rating = 0
-    pain_match = re.search(r'(\d+)\s*/\s*10', text_lower)
+    pain_match  = re.search(r'(\d+)\s*/\s*10', text_lower)
     if not pain_match:
         pain_match = re.search(r'(\d+)\s*out\s*of\s*10', text_lower)
     if pain_match:
         pain_rating = int(pain_match.group(1))
 
-    # Map pain rating to severity score
     if pain_rating >= 9:
         severity_score = 28
     elif pain_rating >= 7:
@@ -98,12 +96,10 @@ def compute_base_score(symptoms_text: str, extracted: dict, analysis: dict) -> d
     elif pain_rating >= 3:
         severity_score = 8
     else:
-        # Fallback: check symptom severity fields
-        severity_map = {"severe": 25, "moderate": 15, "mild": 7}
-        scores = [severity_map.get(s.get("severity", "mild"), 7) for s in symptoms]
+        severity_map   = {"severe": 25, "moderate": 15, "mild": 7}
+        scores         = [severity_map.get(s.get("severity", "mild"), 7) for s in symptoms]
         severity_score = max(scores) if scores else 7
 
-    # Boost for critical symptom types
     critical_keywords = ["chest pain", "chest tightness", "heart", "shortness of breath",
                          "can't breathe", "difficulty breathing", "unconscious", "seizure",
                          "stroke", "paralysis", "severe bleeding", "coughing blood",
@@ -115,17 +111,13 @@ def compute_base_score(symptoms_text: str, extracted: dict, analysis: dict) -> d
 
     severity_score = min(severity_score, 30)
 
-    # ── 2. Red Flag Score (0-25) ───────────────────────────────────────────────
     red_flag_score = min(len(red_flags) * 5, 25)
-
-    # Extra boost for critical red flag keywords in original text
-    critical_rf = ["chest pain", "heart attack", "cardiac", "stroke", "can't breathe",
-                   "difficulty breathing", "loss of consciousness", "severe bleeding",
-                   "crushing pain", "radiating pain", "jaw pain", "left arm pain"]
-    rf_boost = sum(5 for kw in critical_rf if kw in text_lower)
+    critical_rf    = ["chest pain", "heart attack", "cardiac", "stroke", "can't breathe",
+                      "difficulty breathing", "loss of consciousness", "severe bleeding",
+                      "crushing pain", "radiating pain", "jaw pain", "left arm pain"]
+    rf_boost       = sum(5 for kw in critical_rf if kw in text_lower)
     red_flag_score = min(red_flag_score + rf_boost, 25)
 
-    # ── 3. Duration Factor (0-20) ──────────────────────────────────────────────
     if any(w in text_lower for w in ["sudden", "suddenly", "just started", "minutes ago", "just now"]):
         duration_score = 18
     elif any(w in text_lower for w in ["hour", "hours"]):
@@ -139,11 +131,9 @@ def compute_base_score(symptoms_text: str, extracted: dict, analysis: dict) -> d
     else:
         duration_score = 7
 
-    # ── 4. System Involvement (0-15) ──────────────────────────────────────────
     system_count = len(body_systems) if body_systems else 1
     system_score = min(system_count * 5, 15)
 
-    # ── 5. Onset Factor (0-10) ────────────────────────────────────────────────
     if onset == "sudden" or any(w in text_lower for w in ["sudden", "suddenly", "all of a sudden"]):
         onset_score = 10
     elif onset == "gradual":
@@ -151,17 +141,16 @@ def compute_base_score(symptoms_text: str, extracted: dict, analysis: dict) -> d
     else:
         onset_score = 3
 
-    overall = severity_score + red_flag_score + duration_score + system_score + onset_score
-    overall = min(overall, 100)
+    overall = min(severity_score + red_flag_score + duration_score + system_score + onset_score, 100)
 
     return {
         "overall_score": overall,
         "score_breakdown": {
-            "symptom_severity": severity_score,
-            "red_flag_count": red_flag_score,
-            "duration_factor": duration_score,
+            "symptom_severity":  severity_score,
+            "red_flag_count":    red_flag_score,
+            "duration_factor":   duration_score,
             "system_involvement": system_score,
-            "onset_factor": onset_score,
+            "onset_factor":      onset_score,
         },
         "pain_rating_detected": pain_rating if pain_rating > 0 else None,
         "escalation_flag": overall >= 60,
@@ -169,18 +158,17 @@ def compute_base_score(symptoms_text: str, extracted: dict, analysis: dict) -> d
         "reasoning": f"Score based on: pain rating {pain_rating}/10 detected, {len(red_flags)} red flags, {system_count} body system(s) involved, onset: {onset}."
     }
 
-
 # ── LangGraph State ────────────────────────────────────────────────────────────
 class TriageState(TypedDict):
-    anonymized_input: str
-    original_input: str  # kept only for rule-based scoring, never logged
-    session_hash: str
+    anonymized_input:   str
+    original_input:     str
+    session_hash:       str
     extracted_symptoms: Optional[dict]
-    risk_analysis: Optional[dict]
-    risk_score: Optional[dict]
-    triage_decision: Optional[dict]
-    errors: list[str]
-    completed_agents: list[str]
+    risk_analysis:      Optional[dict]
+    risk_score:         Optional[dict]
+    triage_decision:    Optional[dict]
+    errors:             list[str]
+    completed_agents:   list[str]
 
 # ── LLM Client ────────────────────────────────────────────────────────────────
 def get_llm():
@@ -190,18 +178,16 @@ def get_llm():
     return ChatGoogleGenerativeAI(model="gemini-1.5-flash", google_api_key=api_key, temperature=0)
 
 def call_llm_json(system_prompt: str, user_content: str) -> dict:
-    llm = get_llm()
+    llm      = get_llm()
     messages = [SystemMessage(content=system_prompt), HumanMessage(content=user_content)]
     response = llm.invoke(messages)
-    text = response.content.strip()
-    text = re.sub(r"^```json\s*", "", text)
-    text = re.sub(r"\s*```$", "", text)
-    match = re.search(r'\{[\s\S]*\}', text)
+    text     = response.content.strip()
+    text     = re.sub(r"^```json\s*", "", text)
+    text     = re.sub(r"\s*```$", "", text)
+    match    = re.search(r'\{[\s\S]*\}', text)
     if match:
         text = match.group()
     return json.loads(text)
-
-# ── Agent 1: Symptom Extractor ─────────────────────────────────────────────────
 
 # ── Agent 1: Symptom Extractor ─────────────────────────────────────────────────
 def symptom_extractor_agent(state: TriageState) -> TriageState:
@@ -216,7 +202,7 @@ CRITICAL RULES:
 3. affected_areas: list every body part mentioned
 4. body_systems: ALWAYS populate this based on symptoms:
    - chest/heart/palpitations → cardiovascular
-   - breathing/lungs/cough → respiratory  
+   - breathing/lungs/cough → respiratory
    - head/brain/dizziness/vision → neurological
    - stomach/nausea/vomiting/abdomen → gastrointestinal
    - muscles/joints/back/bones → musculoskeletal
@@ -241,34 +227,32 @@ Return ONLY valid JSON:
             user_content=f"Extract ALL symptoms and details. Be very thorough:\n\n{state['anonymized_input']}"
         )
 
-        # Post-process: auto-infer body_systems if Gemini left it empty
         if not result.get("body_systems"):
-            systems = []
+            systems  = []
             combined = " ".join([
-                " ".join(s.get("name","") for s in result.get("symptoms",[])),
-                " ".join(result.get("affected_areas",[])),
+                " ".join(s.get("name", "") for s in result.get("symptoms", [])),
+                " ".join(result.get("affected_areas", [])),
                 state["anonymized_input"]
             ]).lower()
-            if any(w in combined for w in ["chest","heart","cardiac","palpitation","pulse","blood pressure"]):
+            if any(w in combined for w in ["chest", "heart", "cardiac", "palpitation", "pulse", "blood pressure"]):
                 systems.append("cardiovascular")
-            if any(w in combined for w in ["breath","breathing","lung","cough","respiratory","wheez"]):
+            if any(w in combined for w in ["breath", "breathing", "lung", "cough", "respiratory", "wheez"]):
                 systems.append("respiratory")
-            if any(w in combined for w in ["head","brain","dizz","vision","seizure","migraine","neuro","faint","unconscious"]):
+            if any(w in combined for w in ["head", "brain", "dizz", "vision", "seizure", "migraine", "neuro", "faint", "unconscious"]):
                 systems.append("neurological")
-            if any(w in combined for w in ["stomach","abdomen","nausea","vomit","bowel","diarrhea","gastro","indigestion"]):
+            if any(w in combined for w in ["stomach", "abdomen", "nausea", "vomit", "bowel", "diarrhea", "gastro", "indigestion"]):
                 systems.append("gastrointestinal")
-            if any(w in combined for w in ["muscle","joint","bone","back","spine","arm","leg","knee"]):
+            if any(w in combined for w in ["muscle", "joint", "bone", "back", "spine", "arm", "leg", "knee"]):
                 systems.append("musculoskeletal")
-            if any(w in combined for w in ["skin","rash","itch","swelling","hives"]):
+            if any(w in combined for w in ["skin", "rash", "itch", "swelling", "hives"]):
                 systems.append("dermatological")
             result["body_systems"] = systems if systems else ["general"]
 
-        # Auto-fix onset if Gemini missed it
         if result.get("onset") == "unknown":
             text = state["anonymized_input"].lower()
-            if any(w in text for w in ["sudden","suddenly","all of a sudden","just now","minutes ago","out of nowhere","started suddenly"]):
+            if any(w in text for w in ["sudden", "suddenly", "all of a sudden", "just now", "minutes ago", "out of nowhere", "started suddenly"]):
                 result["onset"] = "sudden"
-            elif any(w in text for w in ["gradual","slowly","over time","getting worse","worsening","past few days","past few weeks"]):
+            elif any(w in text for w in ["gradual", "slowly", "over time", "getting worse", "worsening", "past few days", "past few weeks"]):
                 result["onset"] = "gradual"
 
         state["extracted_symptoms"] = result
@@ -280,7 +264,7 @@ Return ONLY valid JSON:
         state["completed_agents"].append("extractor")
     return state
 
-# ── Rule-based condition + medication map ─────────────────────────────────────
+# ── Rule-based Condition Map ───────────────────────────────────────────────────
 CONDITION_MAP = [
     {
         "keywords": ["chest pain", "chest tightness", "chest pressure", "chest discomfort"],
@@ -395,15 +379,14 @@ CONDITION_MAP = [
 ]
 
 def get_rule_based_analysis(text: str, extracted: dict) -> dict:
-    """Always returns conditions and medications based on symptom keywords."""
-    text_lower = text.lower()
+    text_lower    = text.lower()
     symptom_names = " ".join(s.get("name", "") for s in extracted.get("symptoms", [])).lower()
-    combined = text_lower + " " + symptom_names
+    combined      = text_lower + " " + symptom_names
 
-    matched_conditions = []
+    matched_conditions  = []
     matched_medications = []
-    matched_red_flags = []
-    requires_immediate = False
+    matched_red_flags   = []
+    requires_immediate  = False
 
     for entry in CONDITION_MAP:
         if any(kw in combined for kw in entry["keywords"]):
@@ -419,32 +402,29 @@ def get_rule_based_analysis(text: str, extracted: dict) -> dict:
             if entry["immediate"]:
                 requires_immediate = True
 
-    # If nothing matched, add a generic fallback
     if not matched_conditions:
-        matched_conditions = [
+        matched_conditions  = [
             {"name": "General Medical Condition", "likelihood": "moderate", "reasoning": "Based on the symptoms described, a general medical evaluation is recommended."},
-            {"name": "Stress-related Symptoms", "likelihood": "low", "reasoning": "Some symptoms may be related to stress or anxiety."},
+            {"name": "Stress-related Symptoms",   "likelihood": "low",      "reasoning": "Some symptoms may be related to stress or anxiety."},
         ]
         matched_medications = ["Paracetamol 500mg for general pain relief", "Rest and stay hydrated", "Consult a doctor for accurate diagnosis"]
 
     return {
-        "conditions": matched_conditions,
-        "medications": matched_medications,
-        "red_flags": matched_red_flags,
-        "requires_immediate": requires_immediate,
+        "conditions":          matched_conditions,
+        "medications":         matched_medications,
+        "red_flags":           matched_red_flags,
+        "requires_immediate":  requires_immediate,
     }
 
 # ── Agent 2: Risk Analyzer ─────────────────────────────────────────────────────
 def risk_analyzer_agent(state: TriageState) -> TriageState:
     privacy.audit_log(state["session_hash"], "agent_2_start")
 
-    # Step 1: Always run rule-based analysis first — this NEVER fails
     rule_result = get_rule_based_analysis(
         text=state.get("original_input", state["anonymized_input"]),
         extracted=state.get("extracted_symptoms", {}),
     )
 
-    # Step 2: Try LLM to enrich — but fall back to rule-based if it fails
     try:
         llm_result = call_llm_json(
             system_prompt="""You are a medical risk analysis agent. Analyze symptoms and return potential conditions and medication recommendations.
@@ -468,39 +448,36 @@ Return ONLY valid JSON with these exact keys:
             user_content=f"Symptoms: {json.dumps(state['extracted_symptoms'], indent=2)}\n\nDescription: {state['anonymized_input'][:300]}"
         )
 
-        # Merge: use LLM conditions if it returned them, else use rule-based
         conditions = llm_result.get("potential_conditions") or []
         medications = llm_result.get("medication_recommendations") or []
-        red_flags = llm_result.get("red_flags") or []
+        red_flags   = llm_result.get("red_flags") or []
 
-        # Always supplement with rule-based if LLM returned too few
         if len(conditions) < 2:
-            conditions = rule_result["conditions"]
+            conditions  = rule_result["conditions"]
         if len(medications) < 2:
             medications = rule_result["medications"]
         if not red_flags:
-            red_flags = rule_result["red_flags"]
+            red_flags   = rule_result["red_flags"]
 
         final = {
-            "potential_conditions": conditions,
-            "red_flags": red_flags,
-            "body_systems": llm_result.get("body_systems") or state.get("extracted_symptoms", {}).get("body_systems", ["general"]),
-            "risk_factors": llm_result.get("risk_factors") or [],
+            "potential_conditions":       conditions,
+            "red_flags":                  red_flags,
+            "body_systems":               llm_result.get("body_systems") or state.get("extracted_symptoms", {}).get("body_systems", ["general"]),
+            "risk_factors":               llm_result.get("risk_factors") or [],
             "requires_immediate_attention": llm_result.get("requires_immediate_attention") or rule_result["requires_immediate"],
-            "differential_notes": llm_result.get("differential_notes") or "",
+            "differential_notes":         llm_result.get("differential_notes") or "",
             "medication_recommendations": medications,
         }
 
     except Exception as e:
-        # LLM failed — use rule-based entirely
         state["errors"].append(f"analyzer_llm: {str(e)}")
         final = {
-            "potential_conditions": rule_result["conditions"],
-            "red_flags": rule_result["red_flags"],
-            "body_systems": state.get("extracted_symptoms", {}).get("body_systems", ["general"]),
-            "risk_factors": [],
+            "potential_conditions":       rule_result["conditions"],
+            "red_flags":                  rule_result["red_flags"],
+            "body_systems":               state.get("extracted_symptoms", {}).get("body_systems", ["general"]),
+            "risk_factors":               [],
             "requires_immediate_attention": rule_result["requires_immediate"],
-            "differential_notes": "Analysis based on symptom pattern matching.",
+            "differential_notes":         "Analysis based on symptom pattern matching.",
             "medication_recommendations": rule_result["medications"],
         }
 
@@ -509,19 +486,16 @@ Return ONLY valid JSON with these exact keys:
     privacy.audit_log(state["session_hash"], "agent_2_done", {"conditions": len(final["potential_conditions"])})
     return state
 
-
-# ── Agent 3: Risk Scorer (rule-based, LLM-verified) ───────────────────────────
+# ── Agent 3: Risk Scorer ───────────────────────────────────────────────────────
 def risk_scorer_agent(state: TriageState) -> TriageState:
     privacy.audit_log(state["session_hash"], "agent_3_start")
     try:
-        # Step 1: Compute rule-based score (always accurate)
         base_score = compute_base_score(
             symptoms_text=state.get("original_input", state["anonymized_input"]),
             extracted=state.get("extracted_symptoms", {}),
             analysis=state.get("risk_analysis", {})
         )
 
-        # Step 2: Ask LLM to review and optionally adjust (but we keep base if LLM fails)
         try:
             llm_review = call_llm_json(
                 system_prompt="""You are a medical risk scoring reviewer.
@@ -552,16 +526,13 @@ Return ONLY valid JSON:
                 user_content=f"Review this pre-calculated score and adjust if needed:\n\nPre-calculated score: {json.dumps(base_score, indent=2)}\n\nSymptoms: {json.dumps(state['extracted_symptoms'], indent=2)}\n\nAnalysis: {json.dumps(state['risk_analysis'], indent=2)}\n\nOriginal text: {state['anonymized_input'][:300]}"
             )
 
-            # Only use LLM score if it's higher or equal (never let LLM lower a critical score)
             if llm_review.get("overall_score", 0) >= base_score["overall_score"]:
                 final_score = llm_review
             else:
-                # LLM tried to lower the score — keep our rule-based score
                 final_score = base_score
                 final_score["reasoning"] = base_score["reasoning"] + " (LLM adjustment rejected — rule-based score preserved)"
 
         except Exception:
-            # LLM failed — use rule-based score
             final_score = base_score
 
         state["risk_score"] = final_score
@@ -582,7 +553,7 @@ Return ONLY valid JSON:
 def triage_decision_agent(state: TriageState) -> TriageState:
     privacy.audit_log(state["session_hash"], "agent_4_start")
     try:
-        score = state.get("risk_score", {}).get("overall_score", 30)
+        score              = state.get("risk_score", {}).get("overall_score", 30)
         requires_immediate = state.get("risk_analysis", {}).get("requires_immediate_attention", False)
 
         result = call_llm_json(
@@ -591,7 +562,7 @@ The risk score is {score}/100. requires_immediate_attention is {requires_immedia
 
 Urgency mapping — follow STRICTLY:
 - Score 80-100 OR requires_immediate=true with chest pain/breathing: EMERGENCY
-- Score 60-79 OR requires_immediate=true: URGENT  
+- Score 60-79 OR requires_immediate=true: URGENT
 - Score 40-59: SEMI_URGENT
 - Score 20-39: NON_URGENT
 - Score 0-19: SELF_CARE
@@ -614,7 +585,6 @@ urgency_color: EMERGENCY=red, URGENT=orange, SEMI_URGENT=yellow, NON_URGENT=gree
             user_content=f"Determine triage:\n\nRisk Score: {score}/100\nRequires Immediate: {requires_immediate}\n\nSymptoms:\n{json.dumps(state['extracted_symptoms'], indent=2)}\n\nAnalysis:\n{json.dumps(state['risk_analysis'], indent=2)}"
         )
 
-        # Override urgency if score demands it (safety net)
         if score >= 80 or (requires_immediate and score >= 60):
             result["urgency_level"] = "EMERGENCY"
             result["urgency_color"] = "red"
@@ -630,11 +600,12 @@ urgency_color: EMERGENCY=red, URGENT=orange, SEMI_URGENT=yellow, NON_URGENT=gree
         state["triage_decision"] = result
         state["completed_agents"].append("triage")
         privacy.audit_log(state["session_hash"], "agent_4_done", {"urgency": result.get("urgency_level")})
+
     except Exception as e:
         state["errors"].append(f"triage: {str(e)}")
-        score = state.get("risk_score", {}).get("overall_score", 30)
+        score   = state.get("risk_score", {}).get("overall_score", 30)
         urgency = "EMERGENCY" if score >= 80 else "URGENT" if score >= 60 else "SEMI_URGENT" if score >= 40 else "NON_URGENT" if score >= 20 else "SELF_CARE"
-        color = {"EMERGENCY": "red", "URGENT": "orange", "SEMI_URGENT": "yellow", "NON_URGENT": "green", "SELF_CARE": "blue"}[urgency]
+        color   = {"EMERGENCY": "red", "URGENT": "orange", "SEMI_URGENT": "yellow", "NON_URGENT": "green", "SELF_CARE": "blue"}[urgency]
         state["triage_decision"] = {
             "urgency_level": urgency, "urgency_color": color,
             "action_required": "Consult a healthcare professional immediately" if score >= 60 else "Consult a healthcare professional",
@@ -651,7 +622,7 @@ urgency_color: EMERGENCY=red, URGENT=orange, SEMI_URGENT=yellow, NON_URGENT=gree
 # ── Conditional Edge ───────────────────────────────────────────────────────────
 def should_escalate(state: TriageState) -> str:
     analysis = state.get("risk_analysis") or {}
-    score = state.get("risk_score") or {}
+    score    = state.get("risk_score") or {}
     if analysis.get("requires_immediate_attention") or score.get("escalation_flag"):
         return "escalate"
     return "normal"
@@ -665,14 +636,14 @@ def escalation_node(state: TriageState) -> TriageState:
 # ── Build LangGraph ────────────────────────────────────────────────────────────
 def build_triage_graph():
     graph = StateGraph(TriageState)
-    graph.add_node("extractor", symptom_extractor_agent)
-    graph.add_node("analyzer", risk_analyzer_agent)
-    graph.add_node("scorer", risk_scorer_agent)
+    graph.add_node("extractor",  symptom_extractor_agent)
+    graph.add_node("analyzer",   risk_analyzer_agent)
+    graph.add_node("scorer",     risk_scorer_agent)
     graph.add_node("escalation", escalation_node)
-    graph.add_node("triage", triage_decision_agent)
+    graph.add_node("triage",     triage_decision_agent)
     graph.set_entry_point("extractor")
     graph.add_edge("extractor", "analyzer")
-    graph.add_edge("analyzer", "scorer")
+    graph.add_edge("analyzer",  "scorer")
     graph.add_conditional_edges("scorer", should_escalate, {"escalate": "escalation", "normal": "triage"})
     graph.add_edge("escalation", "triage")
     graph.add_edge("triage", END)
@@ -681,9 +652,14 @@ def build_triage_graph():
 triage_graph = build_triage_graph()
 
 # ── Request / Response Models ──────────────────────────────────────────────────
+class PatientLocation(BaseModel):
+    lat: float
+    lon: float
+
 class TriageRequest(BaseModel):
-    symptoms: str
-    session_id: str = ""
+    symptoms:         str
+    session_id:       str = ""
+    patient_location: Optional[PatientLocation] = None
 
     @field_validator("symptoms")
     @classmethod
@@ -695,14 +671,15 @@ class TriageRequest(BaseModel):
         return v.strip()
 
 class TriageResponse(BaseModel):
-    session_hash: str
+    session_hash:       str
     extracted_symptoms: dict
-    risk_analysis: dict
-    risk_score: dict
-    triage_decision: dict
-    completed_agents: list[str]
-    errors: list[str]
-    privacy_log: dict
+    risk_analysis:      dict
+    risk_score:         dict
+    triage_decision:    dict
+    completed_agents:   list[str]
+    errors:             list[str]
+    notification:       Optional[dict] = None
+    privacy_log:        dict
 
 # ── API Endpoints ──────────────────────────────────────────────────────────────
 @app.get("/health")
@@ -712,23 +689,25 @@ async def health():
 @app.post("/api/triage", response_model=TriageResponse)
 async def run_triage(request: TriageRequest, req: Request):
     raw_session = request.session_id or str(uuid.uuid4())
-    s_hash = privacy.session_hash(raw_session)
+    s_hash      = privacy.session_hash(raw_session)
     privacy.audit_log(s_hash, "request_received")
 
     anonymized = privacy.strip_pii(request.symptoms)
     privacy.audit_log(s_hash, "pii_stripped")
 
     initial_state: TriageState = {
-        "anonymized_input": anonymized,
-        "original_input": request.symptoms,  # used only for rule-based scoring
-        "session_hash": s_hash,
+        "anonymized_input":   anonymized,
+        "original_input":     request.symptoms,
+        "session_hash":       s_hash,
         "extracted_symptoms": None,
-        "risk_analysis": None,
-        "risk_score": None,
-        "triage_decision": None,
-        "errors": [],
-        "completed_agents": [],
+        "risk_analysis":      None,
+        "risk_score":         None,
+        "triage_decision":    None,
+        "errors":             [],
+        "completed_agents":   [],
     }
+
+    notification_result = None
 
     try:
         final_state = await triage_graph.ainvoke(initial_state)
@@ -736,7 +715,43 @@ async def run_triage(request: TriageRequest, req: Request):
         logger.error("Graph execution failed: %s", str(e))
         raise HTTPException(status_code=500, detail=f"Triage pipeline failed: {str(e)}")
 
-    privacy.audit_log(s_hash, "pipeline_complete", {"agents_completed": len(final_state["completed_agents"])})
+    privacy.audit_log(s_hash, "pipeline_complete",
+        {"agents_completed": len(final_state["completed_agents"])})
+
+    # ── SMS Notification if score >= 80 ───────────────────────────────────────
+    score = final_state.get("risk_score", {}).get("overall_score", 0)
+
+    if score >= 80 and request.patient_location:
+        try:
+            symptoms_list = [
+                s.get("name", "")
+                for s in final_state.get("extracted_symptoms", {})
+                                    .get("symptoms", [])
+            ]
+            conditions_list = [
+                c.get("name", "")
+                for c in final_state.get("risk_analysis", {})
+                                    .get("potential_conditions", [])
+            ]
+            notification_result = notify_nearest_doctor(
+                db=next(get_db()),
+                patient_lat=request.patient_location.lat,
+                patient_lon=request.patient_location.lon,
+                patient_summary={
+                    "score":      score,
+                    "urgency":    final_state.get("triage_decision", {})
+                                            .get("urgency_level", "HIGH"),
+                    "symptoms":   ", ".join(symptoms_list[:3]),
+                    "conditions": ", ".join(conditions_list[:2]),
+                }
+            )
+            privacy.audit_log(s_hash, "doctor_notified", {
+                "notified": notification_result["notified"],
+                "doctor":   notification_result.get("doctor_name", "none")
+            })
+        except Exception as e:
+            logger.error("Notification failed: %s", str(e))
+            notification_result = {"notified": False, "reason": str(e)}
 
     return TriageResponse(
         session_hash=s_hash,
@@ -746,6 +761,7 @@ async def run_triage(request: TriageRequest, req: Request):
         triage_decision=final_state.get("triage_decision") or {},
         completed_agents=final_state.get("completed_agents", []),
         errors=final_state.get("errors", []),
+        notification=notification_result,
         privacy_log={
             "pii_stripped": True,
             "raw_input_stored": False,
@@ -755,7 +771,136 @@ async def run_triage(request: TriageRequest, req: Request):
         }
     )
 
+# ── Auth Models ────────────────────────────────────────────────────────────────
+class SignupRequest(BaseModel):
+    name:           str
+    email:          str
+    password:       str
+    role:           str
+    phone:          str = ""
+    specialization: str = ""
+    hospital:       str = ""
+
+    @field_validator("role")
+    @classmethod
+    def validate_role(cls, v):
+        if v not in ["patient", "doctor"]:
+            raise ValueError("Role must be patient or doctor")
+        return v
+
+    @field_validator("password")
+    @classmethod
+    def validate_password(cls, v):
+        if len(v) < 6:
+            raise ValueError("Password must be at least 6 characters")
+        return v
+
+class LoginRequest(BaseModel):
+    email:    str
+    password: str
+    role:     str
+
+class AuthResponse(BaseModel):
+    token:   str
+    role:    str
+    name:    str
+    email:   str
+    message: str
+
+# ── Signup ─────────────────────────────────────────────────────────────────────
+@app.post("/auth/signup", response_model=AuthResponse)
+async def signup(request: SignupRequest, db: Session = Depends(get_db)):
+    if request.role == "patient":
+        existing = db.query(Patient).filter(
+            Patient.email == request.email).first()
+    else:
+        existing = db.query(Doctor).filter(
+            Doctor.email == request.email).first()
+
+    if existing:
+        raise HTTPException(
+            status_code=400, detail="Email already registered")
+
+    hashed  = hash_password(request.password)
+    user_id = generate_id()
+
+    if request.role == "patient":
+        user = Patient(
+            id=user_id, name=request.name,
+            email=request.email, password=hashed,
+            phone=request.phone
+        )
+    else:
+        user = Doctor(
+            id=user_id, name=request.name,
+            email=request.email, password=hashed,
+            phone=request.phone,
+            specialization=request.specialization,
+            hospital=request.hospital
+        )
+
+    db.add(user)
+    db.commit()
+
+    token = create_token({
+        "user_id": user_id,
+        "email":   request.email,
+        "role":    request.role,
+        "name":    request.name
+    })
+
+    return AuthResponse(
+        token=token, role=request.role,
+        name=request.name, email=request.email,
+        message="Account created successfully"
+    )
+
+# ── Login ──────────────────────────────────────────────────────────────────────
+@app.post("/auth/login", response_model=AuthResponse)
+async def login(request: LoginRequest, db: Session = Depends(get_db)):
+    if request.role == "patient":
+        user = db.query(Patient).filter(
+            Patient.email == request.email).first()
+    else:
+        user = db.query(Doctor).filter(
+            Doctor.email == request.email).first()
+
+    if not user or not verify_password(request.password, user.password):
+        raise HTTPException(
+            status_code=401, detail="Invalid email or password")
+
+    token = create_token({
+        "user_id": user.id,
+        "email":   user.email,
+        "role":    request.role,
+        "name":    user.name
+    })
+
+    return AuthResponse(
+        token=token, role=request.role,
+        name=user.name, email=user.email,
+        message="Login successful"
+    )
+
+# ── Get Current User ───────────────────────────────────────────────────────────
+@app.get("/auth/me")
+async def get_me(current_user: dict = Depends(get_current_user)):
+    return current_user
+
+# ── Global Exception Handler ───────────────────────────────────────────────────
+@app.exception_handler(RequestValidationError)
+async def validation_exception_handler(request: Request, exc: RequestValidationError):
+    print("=== VALIDATION ERROR DETAILS ===")
+    print(exc.errors())
+    return JSONResponse(
+        status_code=422,
+        content={"detail": exc.errors()}
+    )
+
 @app.exception_handler(Exception)
 async def global_exception_handler(request: Request, exc: Exception):
     logger.error("Unhandled exception: %s", str(exc))
-    return JSONResponse(status_code=500, content={"detail": "Internal server error"})
+    return JSONResponse(
+        status_code=500,
+        content={"detail": "Internal server error"}
+    )
