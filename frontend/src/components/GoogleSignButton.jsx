@@ -49,7 +49,7 @@ const GoogleSignIn = ({ onLoginSuccess }) => {
         <GoogleLogin
           clientId='744771510955-ftb61pp60t813o3sfeoh4hmqegi5mi3a.apps.googleusercontent.com'
           onSuccess={(credentialResponse) => {
-            fetch(`${import.meta.env.VITE_BACKEND_URL}/auth/google/login`, {
+            fetch(`${import.meta.env.VITE_API_BASE}/auth/google/login`, {
               method: "POST",
               headers: { "Content-Type": "application/json" },
               credentials:"include",
