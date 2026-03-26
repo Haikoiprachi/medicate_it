@@ -16,6 +16,7 @@ Base         = declarative_base()
 class Patient(Base):
     __tablename__ = "patients"
     id         = Column(String, primary_key=True)
+    google_id  = Column(String, unique=True, nullable=True)
     name       = Column(String, nullable=False)
     email      = Column(String, unique=True, nullable=False)
     password   = Column(String, nullable=False)
@@ -26,6 +27,7 @@ class Patient(Base):
 class Doctor(Base):
     __tablename__ = "doctors"
     id             = Column(String, primary_key=True)
+    google_id      = Column(String, unique=True, nullable=True) 
     name           = Column(String, nullable=False)
     email          = Column(String, unique=True, nullable=False)
     password       = Column(String, nullable=False)

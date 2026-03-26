@@ -36,8 +36,8 @@ create_tables()
 
 app.add_middleware(
     CORSMiddleware,
-    allow_origins=["*"],
-    allow_credentials=False,
+    allow_origins=["http://localhost:5173"],
+    allow_credentials=True,
     allow_methods=["*"],
     allow_headers=["*"],
 )
@@ -810,6 +810,7 @@ class AuthResponse(BaseModel):
 # ── Signup ─────────────────────────────────────────────────────────────────────
 @app.post("/auth/signup", response_model=AuthResponse)
 async def signup(request: SignupRequest, db: Session = Depends(get_db)):
+    print(request.name , request.password)
     if request.role == "patient":
         existing = db.query(Patient).filter(
             Patient.email == request.email).first()
@@ -882,6 +883,40 @@ async def login(request: LoginRequest, db: Session = Depends(get_db)):
         message="Login successful"
     )
 
+from auth import verify_google_token
+#Google Auth
+from pydantic import BaseModel
+
+class GoogleLoginRequest(BaseModel):
+    token: str
+
+@app.post("/auth/google/login")
+async def google_login(request: GoogleLoginRequest, db: Session = Depends(get_db)):
+    token = request.token
+    if not token:
+        raise HTTPException(status_code=400, detail="Token required")
+    
+    user_info = await verify_google_token(token)
+    email = user_info["email"]
+    
+    # Check if user exists (assume Patient for simplicity; adjust for Doctor)
+    user = db.query(Patient).filter(Patient.email == email).first()
+    if not user:
+        # Create new user
+        user = Patient(
+            id=generate_id(),
+            name=user_info.get("name", "Unknown"),
+            email=email,
+            password="",  # No password for Google users
+            google_id=user_info["sub"],  # Google's user ID
+        )
+        db.add(user)
+        db.commit()
+    
+    # Create JWT
+    jwt_token = create_token({"sub": user.id, "email": user.email})
+    print("google login success ful", user.email)
+    return {"token": jwt_token, "user": {"id": user.id, "name": user.name, "email": user.email}}
 # ── Get Current User ───────────────────────────────────────────────────────────
 @app.get("/auth/me")
 async def get_me(current_user: dict = Depends(get_current_user)):
@@ -904,3 +939,7 @@ async def global_exception_handler(request: Request, exc: Exception):
         status_code=500,
         content={"detail": "Internal server error"}
     )
+
+if __name__ == "__main__":
+    import uvicorn
+    uvicorn.run("main:app", host="0.0.0.0", port=8000, reload=True)

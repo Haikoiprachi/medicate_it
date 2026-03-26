@@ -1,5 +1,6 @@
 import { useState } from "react";
 import axios from "axios";
+import GoogleSignIn from "./components/GoogleSignButton";
 
 const API_BASE = import.meta.env.VITE_API_BASE || "http://localhost:8000";
 
@@ -267,6 +268,7 @@ export default function LoginPage({ onLoginSuccess }) {
               ? "No account? Click SIGNUP above."
               : "Already registered? Click LOGIN above."}
           </p>
+        <GoogleSignIn onLoginSuccess={onLoginSuccess}/>
         </div>
       </div>
     </div>
