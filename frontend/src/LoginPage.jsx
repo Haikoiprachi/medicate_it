@@ -24,6 +24,7 @@ export default function LoginPage({ onLoginSuccess }) {
   };
 
   const handleSubmit = async () => {
+    alert("handleSubmit triggered");
     if (!form.email || !form.password) {
       setError("Email and password are required");
       return;
@@ -34,8 +35,46 @@ export default function LoginPage({ onLoginSuccess }) {
     }
 
     setLoading(true);
+
     try {
       const endpoint = mode === "login" ? "/auth/login" : "/auth/signup";
+
+      if (mode === "signup") {
+        if (!navigator.geolocation) {
+          setError("Geolocation not supported");
+          setLoading(false);
+          return;
+        }
+
+        navigator.geolocation.getCurrentPosition(
+          async (pos) => {
+            alert("INSIDE GEOLOCATION BLOCK");
+            const payload = {
+              ...form,
+              role,
+              latitude: pos.coords.latitude,
+              longitude: pos.coords.longitude,
+            };
+
+            const res = await axios.post(`${API_BASE}${endpoint}`, payload);
+
+            localStorage.setItem("token", res.data.token);
+            localStorage.setItem("role", res.data.role);
+            localStorage.setItem("name", res.data.name);
+            localStorage.setItem("email", res.data.email);
+
+            onLoginSuccess(res.data);
+            setLoading(false);
+          },
+          () => {
+            setError("Please allow location access");
+            setLoading(false);
+          },
+        );
+
+        return;
+      }
+
       const payload =
         mode === "login"
           ? { email: form.email, password: form.password, role }
@@ -268,7 +307,7 @@ export default function LoginPage({ onLoginSuccess }) {
               ? "No account? Click SIGNUP above."
               : "Already registered? Click LOGIN above."}
           </p>
-        <GoogleSignIn onLoginSuccess={onLoginSuccess}/>
+          <GoogleSignIn onLoginSuccess={onLoginSuccess} />
         </div>
       </div>
     </div>
